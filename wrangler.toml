@@ -1,4 +1,3 @@
 name = "testt"
 main = "src/index.js"
 compatibility_date = "2022-12-05"
-usage_model = "unbound"

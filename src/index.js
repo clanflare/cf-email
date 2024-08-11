@@ -4,7 +4,7 @@ const PostalMime = require("postal-mime");
 
 const API_VERSION = 10;
 const DISCORD_API_URL = `https://discord.com/api/v${API_VERSION}`;
-const GUILD_ID = "1170627136059609118";
+const GUILD_ID = "1209956399073992745";
 const TOKEN = "";
 
 const myHeaders = new Headers();
@@ -90,10 +90,7 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
   try { 
     const messageData = errorMsg
       ? `An error occurred while processing your email. Error details: ${errorMsg}`
-      : `This is an automated reply to your email with the subject ${parsedEmail.subject}.
-Number of attachments: ${parsedEmail.attachments.length}.
-
-Goodbye.`;
+      : `This is an automated reply to your email with the subject ${parsedEmail.subject}.\nYour email has been succesfully delivered to ${parsedEmail.to[0].address.split("@")[0]}`;
 
     const msg = createMimeMessage();
     msg.setSender({ name: "Auto-replier", addr: event.to });
@@ -125,7 +122,8 @@ export default {
 
       if (member) {
         const dm = await createDmChannel(member.user.id);
-        await sendMessage(dm.id, parsedEmail.text);
+        const dmContent = `## From: ${event.from}\n## Subject: ${parsedEmail.subject}\n ${parsedEmail.text}`
+        await sendMessage(dm.id, dmContent);
       } else {
         throw new Error(`No member found with username: ${username}`);
       }
