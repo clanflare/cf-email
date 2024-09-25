@@ -275,6 +275,105 @@ function extractLinksAndImages(htmlContent) {
   return { httpLinks, mailtoLinks, telLinks, images };
 }
 
+// Function to send multiple embeds in Discord messages
+async function sendEmbedsWithBatching(channelId, embeds) {
+  const maxEmbedsPerMessage = 10;
+  const maxTotalEmbedSize = 6000; // Maximum total size of embeds per message
+  const messages = [];
+
+  let currentBatch = [];
+  let currentTotalSize = 0;
+
+  for (const embed of embeds) {
+    const embedSize = JSON.stringify(embed).length;
+
+    // If adding this embed would exceed the size limit or embed count limit, send the current batch
+    if (
+      currentTotalSize + embedSize > maxTotalEmbedSize ||
+      currentBatch.length >= maxEmbedsPerMessage
+    ) {
+      // Send current batch
+      const payload = { embeds: currentBatch };
+      await sendEmbedBatch(channelId, payload);
+      messages.push(payload);
+      // Reset batch
+      currentBatch = [];
+      currentTotalSize = 0;
+    }
+
+    // Add embed to current batch
+    currentBatch.push(embed);
+    currentTotalSize += embedSize;
+  }
+
+  // Send any remaining embeds
+  if (currentBatch.length > 0) {
+    const payload = { embeds: currentBatch };
+    await sendEmbedBatch(channelId, payload);
+    messages.push(payload);
+  }
+
+  return messages;
+}
+
+// Helper function to send a batch of embeds
+async function sendEmbedBatch(channelId, payload) {
+  const response = await fetchWithRateLimit(
+    `${DISCORD_API_URL}/channels/${channelId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bot ${TOKEN}`,
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Failed to send message. Status: ${response.status}. Error: ${errorText}`
+    );
+  }
+
+  return await response.json();
+}
+
+// Function to send the text attachment in a separate message
+async function sendTextAttachment(channelId, textContent) {
+  try {
+    const formData = new FormData();
+
+    // Create a Blob from the text content
+    const blob = new Blob([textContent], { type: "text/plain" });
+    formData.append("files[0]", blob, "full_message.txt");
+
+    const response = await fetchWithRateLimit(
+      `${DISCORD_API_URL}/channels/${channelId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bot ${TOKEN}`,
+        },
+        body: formData,
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Failed to send message with attachment. Status: ${response.status}. Error: ${errorText}`
+      );
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("Error sending text attachment:", error);
+    throw new Error("Failed to send the text attachment.");
+  }
+}
+
 // Function to send an embed message in a Discord channel
 async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) {
   try {
@@ -282,7 +381,9 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     const guildData = await fetchGuildData(GUILD_ID);
     const thumbnailUrl = getGuildIconURL(guildData);
 
-    const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
+    // Prepare "From" and "To" information
+    const fromField = event.from;
+    const toField = parsedEmail.to.map((addr) => addr.address).join(", ");
 
     // Extract text content from parsedEmail
     let emailTextContent = parsedEmail.text;
@@ -294,123 +395,108 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     // Provide a fallback if no text content is available
     emailTextContent = emailTextContent || "(No text content)";
 
-    // Prepare "From" and "To" information
-    const fromField = event.from;
-    const toField = parsedEmail.to.map((addr) => addr.address).join(", ");
+    // Maximum allowed length for description field
+    const maxDescriptionLength = 4096;
 
-    // Prepare attachment links
-    let attachmentsText = "";
-    if (attachmentLinks && attachmentLinks.length > 0) {
-      attachmentsText = attachmentLinks
-        .map((link, index) => `[Attachment ${index + 1}](${link})`)
-        .join("\n");
-    }
-
-    // Construct the description
+    // Construct the initial embed description
     let descriptionParts = [];
 
     // Add "From" and "To" information
     descriptionParts.push(`**👤 From:** ${fromField}`);
     descriptionParts.push(`**📩 To:** ${toField}`);
 
-    // Add attachments if any
-    if (attachmentsText) {
-      descriptionParts.push(`**📎 Attachments:**\n${attachmentsText}`);
+    // Combine the initial description
+    let initialDescription = descriptionParts.join("\n\n");
+
+    // Ensure initialDescription does not exceed maxDescriptionLength
+    if (initialDescription.length > maxDescriptionLength) {
+      initialDescription = initialDescription.substring(0, maxDescriptionLength);
     }
 
-    // Add a separator
-    descriptionParts.push(`---`);
+    // Now, create the first embed
+    const title = `📧 ${parsedEmail.subject || "New Email Received"}`;
+    const footerText = "📬 Sent via Clanflare Email System";
+    const timestamp = new Date().toISOString();
 
-    // Add the email content
-    descriptionParts.push(emailTextContent);
-
-    // Join all parts to form the full description
-    let description = descriptionParts.join("\n\n");
-
-    // Truncate content to respect Discord embed character limits
-    const maxDescriptionLength = 4096;
-    if (description.length > maxDescriptionLength) {
-      description = description.substring(0, maxDescriptionLength - 3) + '...';
-    }
-
-    // Prepare the embed
-    const embed = {
-      title: `📧 ${parsedEmail.subject || "New Email Received"}`,
-      description: description,
+    // Prepare the first embed
+    let firstEmbed = {
+      title: title,
+      description: initialDescription, // We will add content after adjusting
       footer: {
-        text: "📬 Sent via Clanflare Email System",
+        text: footerText,
       },
-      timestamp: new Date().toISOString(),
-      thumbnail: {
-        url:
-          thumbnailUrl ||
-          "https://cdn.discordapp.com/embed/avatars/0.png", // Default avatar if no icon is set
-      },
+      timestamp: timestamp,
     };
 
-    const payload = {
-      embeds: [embed],
-    };
+    let embeds = [firstEmbed];
 
-    const response = await fetchWithRateLimit(sendMessageURL, {
-      method: "POST",
-      body: JSON.stringify(payload),
-      ...requestOptions,
-    });
+    // Prepare attachment links to be added to embeds
+    if (attachmentLinks && attachmentLinks.length > 0) {
+      const attachmentTextChunks = [];
+      let currentChunk = "";
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(
-        `Failed to send embed message. Status: ${response.status}. Error: ${errorText}`
-      );
+      // Create chunks of attachment links that fit within the description limit
+      for (const [index, link] of attachmentLinks.entries()) {
+        const attachmentLine = `[Attachment ${index + 1}](${link})\n`;
+        if ((currentChunk + attachmentLine).length > maxDescriptionLength) {
+          attachmentTextChunks.push(currentChunk);
+          currentChunk = attachmentLine;
+        } else {
+          currentChunk += attachmentLine;
+        }
+      }
+      if (currentChunk) {
+        attachmentTextChunks.push(currentChunk);
+      }
+
+      // Add attachment chunks to embeds
+      for (const chunk of attachmentTextChunks) {
+        // If there's room in the first embed's description, add it there
+        let lastEmbed = embeds[embeds.length - 1];
+        if (lastEmbed.description.length + `\n\n**📎 Attachments:**\n${chunk}`.length <= maxDescriptionLength) {
+          lastEmbed.description += `\n\n**📎 Attachments:**\n${chunk}`;
+        } else {
+          // Create a new embed for attachments
+          embeds.push({
+            description: `**📎 Attachments:**\n${chunk}`,
+          });
+        }
+      }
     }
 
-    // Check if description was truncated, and send full content as a follow-up if necessary
-    if (description.endsWith('...') && emailTextContent.length > 0) {
-      await sendFullTextMessage(channelId, emailTextContent);
+    // Add email content to embeds
+    let content = emailTextContent;
 
+    while (content.length > 0) {
+      let chunk = content.substring(0, maxDescriptionLength);
+      // Ensure we don't split in the middle of a word
+      const lastSpaceIndex = chunk.lastIndexOf(' ');
+      if (lastSpaceIndex > -1 && lastSpaceIndex > chunk.length * 0.8) {
+        chunk = chunk.substring(0, lastSpaceIndex);
+      }
+
+      embeds.push({
+        description: chunk,
+      });
+
+      content = content.substring(chunk.length).trim();
     }
 
-    return await response.json();
+    // Log the number of embeds
+    console.log(`Total number of embeds: ${embeds.length}`);
+
+    // Send embeds with batching
+    await sendEmbedsWithBatching(channelId, embeds);
+
+    // Send the text attachment in a separate message
+    if (emailTextContent && emailTextContent.length > 0) {
+      await sendTextAttachment(channelId, emailTextContent);
+    }
+
+    return; // No need to return a response here
   } catch (error) {
     console.error("Error sending embed message:", error);
     throw new Error("Failed to send an embed message to the member.");
-  }
-}
-
-// Function to send the full text message in chunks
-async function sendFullTextMessage(channelId, textContent) {
-  try {
-    const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
-    const maxMessageLength = 2000; // Discord's message character limit
-    const codeBlockOverhead = 8; // Length of "```\n" + "\n```"
-    const maxChunkSize = maxMessageLength - codeBlockOverhead;
-    const regex = new RegExp(`.{1,${maxChunkSize}}`, 'gs'); // 's' flag for dot to match newlines
-
-    const chunks = textContent.match(regex);
-
-    for (const chunk of chunks) {
-      const formattedChunk = `\`\`\`\n${chunk}\n\`\`\``; // Wrap in code block
-
-      const response = await fetchWithRateLimit(sendMessageURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bot ${TOKEN}`,
-        },
-        body: JSON.stringify({ content: formattedChunk }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Failed to send message chunk. Status: ${response.status}. Error: ${errorText}`
-        );
-      }
-    }
-  } catch (error) {
-    console.error("Error sending full text message:", error);
-    throw new Error("Failed to send the full message content.");
   }
 }
 
