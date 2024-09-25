@@ -21,11 +21,6 @@ let GUILD_ID, TOKEN, ROLES_REQUIRED, CHANNEL_MAP, ATTACHMENTS_CHANNEL;
 const myHeaders = new Headers();
 myHeaders.append("Content-Type", "application/json");
 
-const requestOptions = {
-  headers: myHeaders,
-  redirect: "follow",
-};
-
 // Rate limiting configuration
 const MAX_RETRIES = 3;
 const DEFAULT_RETRY_AFTER_MS = 1000; // 1 second
@@ -35,20 +30,10 @@ const DEFAULT_RETRY_AFTER_MS = 1000; // 1 second
  */
 
 // Convert a stream to an ArrayBuffer
-async function streamToArrayBuffer(stream, streamSize) {
+async function streamToArrayBuffer(stream) {
   try {
-    const result = new Uint8Array(streamSize);
-    let bytesRead = 0;
-    const reader = stream.getReader();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      result.set(value, bytesRead);
-      bytesRead += value.length;
-    }
-
-    return result;
+    const arrayBuffer = await new Response(stream).arrayBuffer();
+    return new Uint8Array(arrayBuffer);
   } catch (error) {
     console.error("Error converting stream to ArrayBuffer:", error);
     throw new Error("Failed to process email stream.");
@@ -121,7 +106,7 @@ function extractTextFromHtml(htmlContent) {
 // Parse the email using PostalMime
 async function parseEmail(event) {
   try {
-    const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
+    const rawEmail = await streamToArrayBuffer(event.raw);
     const parser = new PostalMime();
     return await parser.parse(rawEmail);
   } catch (error) {
@@ -158,12 +143,15 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
         <p style="font-size: 0.9em; color: #888;">Timestamp: ${timestamp}</p>
       `;
 
+    const fromAddress = parsedEmail.from.address;
+    const toAddress = parsedEmail.to[0].address;
+
     const msg = createMimeMessage();
-    msg.setSender({ name: "Auto-replier", addr: event.to });
-    msg.setRecipient(event.from);
+    msg.setSender({ name: "Auto-replier", addr: toAddress });
+    msg.setRecipient(fromAddress);
     msg.setSubject(subject);
 
-    if (parsedEmail?.messageId) {
+    if (parsedEmail.messageId) {
       msg.setHeader("In-Reply-To", parsedEmail.messageId);
     }
 
@@ -172,8 +160,16 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
       data: messageData,
     });
 
-    const message = new EmailMessage(event.to, event.from, msg.asRaw());
-    await event.reply(message);
+    const message = new EmailMessage(toAddress, fromAddress, msg.asRaw());
+    // Attempt to reply to the original email
+    try {
+      await event.reply(message);
+    } catch (replyError) {
+      console.warn("event.reply() failed, attempting to send a new email:", replyError);
+
+      // If event.reply() fails, send a new email instead
+      await event.send(message);
+    }
   } catch (error) {
     console.error("Error sending auto-reply:", error);
   }
@@ -219,7 +215,10 @@ async function findDiscordMember(username) {
       username
     )}&limit=1000`;
 
-    const response = await fetchWithRateLimit(fetchMemberURL, requestOptions);
+    const response = await fetchWithRateLimit(fetchMemberURL, {
+      method: "GET",
+      headers: myHeaders,
+    });
     if (!response.ok) {
       throw new Error(`Failed to fetch Discord members. Status: ${response.status}`);
     }
@@ -233,7 +232,7 @@ async function findDiscordMember(username) {
 }
 
 // Check if the member has the required role(s)
-async function hasRequiredRoles(member) {
+function hasRequiredRoles(member) {
   if (!member) return false;
   const memberRoles = member.roles; // Array of role IDs the member has
 
@@ -249,7 +248,10 @@ async function createDmChannel(recipientId) {
     const response = await fetchWithRateLimit(createDmURL, {
       method: "POST",
       body: JSON.stringify({ recipient_id: recipientId }),
-      ...requestOptions,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bot ${TOKEN}`,
+      },
     });
 
     if (!response.ok) {
@@ -532,19 +534,29 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
 
 export default {
   async email(event, env, ctx) {
-    // Initialize environment variables
-    GUILD_ID = env.GUILD_ID;
-    TOKEN = env.TOKEN;
-    ROLES_REQUIRED = env.ROLES_REQUIRED ? env.ROLES_REQUIRED.split(",") : [];
-    CHANNEL_MAP = Object.fromEntries(
-      env.CHANNEL_MAP.split(",").map((item) => item.trim().split(":"))
-    );
-    ATTACHMENTS_CHANNEL = env.ATTACHMENTS_CHANNEL;
-
-    myHeaders.append("Authorization", `Bot ${TOKEN}`);
-
-    const parsedEmail = await parseEmail(event);
+    let parsedEmail;
     try {
+      // Initialize environment variables with defaults or throw errors if required variables are missing
+      if (!env.GUILD_ID) throw new Error("GUILD_ID environment variable is not defined.");
+      if (!env.TOKEN) throw new Error("TOKEN environment variable is not defined.");
+      if (!env.ATTACHMENTS_CHANNEL) throw new Error("ATTACHMENTS_CHANNEL environment variable is not defined.");
+
+      GUILD_ID = env.GUILD_ID;
+      TOKEN = env.TOKEN;
+      ROLES_REQUIRED = env.ROLES_REQUIRED ? env.ROLES_REQUIRED.split(",") : [];
+
+      if (env.CHANNEL_MAP) {
+        CHANNEL_MAP = Object.fromEntries(
+          env.CHANNEL_MAP.split(",").map((item) => item.trim().split(":"))
+        );
+      } else {
+        CHANNEL_MAP = {};
+      }
+
+      ATTACHMENTS_CHANNEL = env.ATTACHMENTS_CHANNEL;
+
+      myHeaders.append("Authorization", `Bot ${TOKEN}`);
+      parsedEmail = await parseEmail(event);
       const username = parsedEmail.to[0].address.split("@")[0];
 
       // Handle attachments
@@ -561,13 +573,15 @@ export default {
         const member = await findDiscordMember(username);
 
         if (member) {
-          if (!(await hasRequiredRoles(member))) {
+          if (!hasRequiredRoles(member)) {
             throw new Error("Member does not have the required role(s).");
           }
           const dm = await createDmChannel(member.user.id);
           targetChannelId = dm.id;
-        } else {
+        } else if (CHANNEL_MAP["others"]) {
           targetChannelId = CHANNEL_MAP["others"];
+        } else {
+          throw new Error("No target channel found for the recipient.");
         }
       }
 
