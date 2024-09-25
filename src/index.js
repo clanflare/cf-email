@@ -1,14 +1,19 @@
+// Import necessary modules
 import { Buffer } from "node:buffer";
 globalThis.Buffer = Buffer;
 
 import { EmailMessage } from "cloudflare:email";
 import { createMimeMessage } from "mimetext";
-import PostalMime from 'postal-mime';
+const PostalMime = require("postal-mime");
 
+// Discord API version and base URL
 const API_VERSION = 10;
 const DISCORD_API_URL = `https://discord.com/api/v${API_VERSION}`;
+
+// Variables to hold environment variables
 var GUILD_ID, TOKEN, ROLES_REQUIRED, CHANNEL_MAP;
 
+// Headers and request options
 let myHeaders = new Headers();
 myHeaders.append("Content-Type", "application/json");
 
@@ -38,7 +43,7 @@ async function streamToArrayBuffer(stream, streamSize) {
   }
 }
 
-// Function to parse the email
+// Function to parse the email using PostalMime
 async function parseEmail(event) {
   try {
     const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
@@ -53,8 +58,8 @@ async function parseEmail(event) {
 // Function to find Discord member by username
 async function findDiscordMember(username) {
   try {
-    const fetchMemberURL = `${DISCORD_API_URL}/guilds/${GUILD_ID}/members/search?query=${username}&limit=1000`;
-    const response = await fetch(fetchMemberURL, requestOptions);
+    const fetchMemberURL = `${DISCORD_API_URL}/guilds/${GUILD_ID}/members/search?query=${encodeURIComponent(username)}&limit=1000`;
+    const response = await fetchWithRateLimit(fetchMemberURL, requestOptions);
     if (!response.ok) {
       throw new Error(
         `Failed to fetch Discord members. Status: ${response.status}`
@@ -73,6 +78,8 @@ async function hasRequiredRoles(member) {
   if (!member) return false;
   const memberRoles = member.roles; // This is an array of role IDs the member has
 
+  if (ROLES_REQUIRED.length === 0) return true; // No roles required, so return true
+
   // Check if the member has at least one of the required roles
   return ROLES_REQUIRED.some((role) => memberRoles.includes(role));
 }
@@ -81,7 +88,7 @@ async function hasRequiredRoles(member) {
 async function createDmChannel(recipientId) {
   try {
     const createDmURL = `${DISCORD_API_URL}/users/@me/channels`;
-    const response = await fetch(createDmURL, {
+    const response = await fetchWithRateLimit(createDmURL, {
       method: "POST",
       body: JSON.stringify({ recipient_id: recipientId }),
       ...requestOptions,
@@ -97,34 +104,6 @@ async function createDmChannel(recipientId) {
     throw new Error(
       "Failed to create a direct message channel with the member."
     );
-  }
-}
-
-// Function to send a message in a Discord channel
-// Function to send a message in a Discord channel with better formatting
-async function sendMessage(channelId, parsedEmail, event) {
-  try {
-    const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
-    const emailContent = `
-**From:** ${event.from}
-**To:** ${parsedEmail.to.map((addr) => addr.address).join(", ")}
-**Subject:** ${parsedEmail.subject}
-
-${parsedEmail.text ? parsedEmail.text : "(No text content)"}
-    `.trim();
-
-    const response = await fetch(sendMessageURL, {
-      method: "POST",
-      body: JSON.stringify({ content: emailContent }),
-      ...requestOptions,
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to send message. Status: ${response.status}`);
-    }
-    return await response.json();
-  } catch (error) {
-    console.error("Error sending message:", error);
-    throw new Error("Failed to send a message to the member.");
   }
 }
 
@@ -180,7 +159,7 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
 async function fetchGuildData(guildId) {
   try {
     const url = `${DISCORD_API_URL}/guilds/${guildId}`;
-    const response = await fetch(url, {
+    const response = await fetchWithRateLimit(url, {
       method: "GET",
       headers: myHeaders,
     });
@@ -213,7 +192,40 @@ function truncateText(text, maxLength) {
     : text;
 }
 
-// Function to send a message in a Discord channel using an improved and visually appealing embed
+// Function to extract text from HTML content
+function extractTextFromHtml(htmlContent) {
+  // Remove script and style tags and their content
+  htmlContent = htmlContent.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '');
+  htmlContent = htmlContent.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, '');
+  // Replace line breaks and paragraph tags with newlines
+  htmlContent = htmlContent.replace(/<(br|\/p|p)[^>]*>/gi, '\n');
+  // Remove all remaining HTML tags
+  const textContent = htmlContent.replace(/<[^>]+>/g, '');
+  // Decode HTML entities
+  const decodedText = decodeHtmlEntities(textContent);
+  return decodedText;
+}
+
+// Function to decode HTML entities
+function decodeHtmlEntities(text) {
+  const entities = {
+    nbsp: ' ',
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+    '#39': "'",
+  };
+  return text.replace(/&([^;]+);/g, (match, entity) => {
+    if (entities[entity]) {
+      return entities[entity];
+    }
+    return match;
+  });
+}
+
+// Function to send an embed message in a Discord channel
 async function sendEmbedMessage(channelId, parsedEmail, event) {
   try {
     // Fetch guild data to get the icon dynamically
@@ -222,12 +234,19 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
 
     const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
 
+    // Extract text content from parsedEmail
+    let emailTextContent = parsedEmail.text;
+
+    if (!emailTextContent && parsedEmail.html) {
+      emailTextContent = extractTextFromHtml(parsedEmail.html);
+    }
+
+    // Provide a fallback if no text content is available
+    emailTextContent = emailTextContent || "(No text content)";
+
     // Truncate content to respect Discord embed character limits
     const title = truncateText(`📧 New Email Received`, 256);
-    const description = truncateText(
-      parsedEmail.text ? parsedEmail.text : "(No text content)",
-      4096
-    );
+    const description = truncateText(emailTextContent, 4096);
     const fromField = truncateText(event.from, 256);
     const toField = truncateText(
       parsedEmail.to.map((addr) => addr.address).join(", "),
@@ -269,7 +288,7 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
       },
     };
 
-    const response = await fetch(sendMessageURL, {
+    const response = await fetchWithRateLimit(sendMessageURL, {
       method: "POST",
       body: JSON.stringify({ embeds: [embed] }),
       ...requestOptions,
@@ -282,8 +301,13 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
     }
 
     // Check if description was truncated, and send full content as a follow-up if necessary
-    if (description !== parsedEmail.text) {
-      await sendFullTextMessage(channelId, parsedEmail.text);
+    if (description !== emailTextContent) {
+      await sendFullTextMessage(channelId, emailTextContent);
+    }
+
+    // Handle attachments if any
+    if (parsedEmail.attachments && parsedEmail.attachments.length > 0) {
+      await handleAttachments(channelId, parsedEmail.attachments);
     }
 
     return await response.json();
@@ -293,14 +317,95 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
   }
 }
 
+// Function to send the full text message in chunks
+async function sendFullTextMessage(channelId, textContent) {
+  try {
+    const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
+    const maxMessageLength = 2000; // Discord's message character limit
+    let index = 0;
+    const totalLength = textContent.length;
+
+    while (index < totalLength) {
+      const chunk = textContent.substring(index, index + maxMessageLength - 6); // Adjust for code block markers
+      const formattedChunk = `\`\`\`\n${chunk}\n\`\`\``; // Wrap in code block
+
+      const response = await fetchWithRateLimit(sendMessageURL, {
+        method: "POST",
+        body: JSON.stringify({ content: formattedChunk }),
+        ...requestOptions,
+      });
+      if (!response.ok) {
+        throw new Error(
+          `Failed to send message chunk. Status: ${response.status}`
+        );
+      }
+      index += maxMessageLength - 6;
+    }
+  } catch (error) {
+    console.error("Error sending full text message:", error);
+    throw new Error("Failed to send the full message content.");
+  }
+}
+
+// Function to handle rate limits in fetch requests
+async function fetchWithRateLimit(url, options) {
+  let response = await fetch(url, options);
+
+  if (response.status === 429) {
+    const retryAfter = response.headers.get('Retry-After');
+    const retryAfterMs = retryAfter ? parseFloat(retryAfter) * 1000 : 1000; // Default to 1 second
+    console.warn(`Rate limited. Retrying after ${retryAfterMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+    // Retry the request
+    response = await fetch(url, options);
+  }
+
+  return response;
+}
+
+// Function to handle attachments
+async function handleAttachments(channelId, attachments) {
+  for (const attachment of attachments) {
+    // Check if the attachment is an image or other type
+    if (attachment.contentType.startsWith('image/') || attachment.contentType.startsWith('application/')) {
+      // Send the attachment as a file message in Discord
+      await sendFileMessage(channelId, attachment);
+    } else {
+      // Handle other types of attachments as needed
+      // For example, send a message indicating an unsupported attachment was received
+      console.warn(`Unsupported attachment type: ${attachment.contentType}`);
+    }
+  }
+}
+
+// Function to send file messages to Discord
+async function sendFileMessage(channelId, attachment) {
+  const formData = new FormData();
+  formData.append('files[0]', new Blob([attachment.content], { type: attachment.contentType }), attachment.filename);
+
+  const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
+
+  const response = await fetchWithRateLimit(sendMessageURL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bot ${TOKEN}`,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to send file message. Status: ${response.status}`);
+  }
+}
+
 // Main function to handle the email event
 export default {
   async email(event, env, ctx) {
     GUILD_ID = env.GUILD_ID;
     TOKEN = env.TOKEN;
-    ROLES_REQUIRED = env.ROLES_REQUIRED.split(",");
+    ROLES_REQUIRED = env.ROLES_REQUIRED === "" ? [] : env.ROLES_REQUIRED.split(",");
     CHANNEL_MAP = Object.fromEntries(
-      env.CHANNEL_MAP.split(", ").map((item) => item.split(":"))
+      env.CHANNEL_MAP.split(",").map((item) => item.trim().split(":"))
     );
 
     myHeaders.append("Authorization", `Bot ${TOKEN}`);
@@ -308,7 +413,6 @@ export default {
     try {
       parsedEmail = await parseEmail(event);
       const username = parsedEmail.to[0].address.split("@")[0];
-
       if (CHANNEL_MAP[username]) {
         await sendEmbedMessage(CHANNEL_MAP[username], parsedEmail, event);
       } else {
@@ -319,10 +423,9 @@ export default {
             throw new Error(`Member does not have the required role(s).`);
           }
           const dm = await createDmChannel(member.user.id);
-          // await sendMessage(dm.id, parsedEmail, event);
           await sendEmbedMessage(dm.id, parsedEmail, event);
         } else {
-          throw new Error(`No member found with username: ${username}`);
+          await sendEmbedMessage(CHANNEL_MAP["others"], parsedEmail, event);
         }
       }
       await sendAutoReply(event, parsedEmail);
