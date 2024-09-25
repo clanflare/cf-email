@@ -341,12 +341,22 @@ async function sendEmbedBatch(channelId, payload) {
 }
 
 // Function to send the text attachment in a separate message
-async function sendTextAttachment(channelId, textContent) {
+async function sendTextAttachment(channelId, textContent, attachmentLinks) {
   try {
     const formData = new FormData();
 
-    // Create a Blob from the text content
-    const blob = new Blob([textContent], { type: "text/plain" });
+    // Combine text content and attachments data
+    let fullTextContent = textContent;
+
+    if (attachmentLinks && attachmentLinks.length > 0) {
+      const attachmentsText = attachmentLinks
+        .map((link, index) => `Attachment ${index + 1}: ${link}`)
+        .join("\n");
+      fullTextContent += `\n\nAttachments:\n${attachmentsText}`;
+    }
+
+    // Create a Blob from the full text content
+    const blob = new Blob([fullTextContent], { type: "text/plain" });
     formData.append("files[0]", blob, "full_message.txt");
 
     const response = await fetchWithRateLimit(
@@ -451,9 +461,14 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
 
       // Add attachment chunks to embeds
       for (const chunk of attachmentTextChunks) {
-        // If there's room in the first embed's description, add it there
+        // If there's room in the last embed's description, add it there
         let lastEmbed = embeds[embeds.length - 1];
-        if (lastEmbed.description.length + `\n\n**📎 Attachments:**\n${chunk}`.length <= maxDescriptionLength) {
+        if (
+          lastEmbed.description &&
+          lastEmbed.description.length +
+            `\n\n**📎 Attachments:**\n${chunk}`.length <=
+            maxDescriptionLength
+        ) {
           lastEmbed.description += `\n\n**📎 Attachments:**\n${chunk}`;
         } else {
           // Create a new embed for attachments
@@ -470,7 +485,7 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     while (content.length > 0) {
       let chunk = content.substring(0, maxDescriptionLength);
       // Ensure we don't split in the middle of a word
-      const lastSpaceIndex = chunk.lastIndexOf(' ');
+      const lastSpaceIndex = chunk.lastIndexOf(" ");
       if (lastSpaceIndex > -1 && lastSpaceIndex > chunk.length * 0.8) {
         chunk = chunk.substring(0, lastSpaceIndex);
       }
@@ -490,7 +505,7 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
 
     // Send the text attachment in a separate message
     if (emailTextContent && emailTextContent.length > 0) {
-      await sendTextAttachment(channelId, emailTextContent);
+      await sendTextAttachment(channelId, emailTextContent, attachmentLinks);
     }
 
     return; // No need to return a response here
@@ -501,16 +516,21 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
 }
 
 // Function to handle rate limits in fetch requests
-async function fetchWithRateLimit(url, options) {
+async function fetchWithRateLimit(url, options, retries = 3) {
   let response = await fetch(url, options);
 
-  if (response.status === 429) {
+  while (response.status === 429 && retries > 0) {
     const retryAfter = response.headers.get("Retry-After");
     const retryAfterMs = retryAfter ? parseFloat(retryAfter) * 1000 : 1000; // Default to 1 second
     console.warn(`Rate limited. Retrying after ${retryAfterMs}ms`);
     await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
     // Retry the request
     response = await fetch(url, options);
+    retries--;
+  }
+
+  if (response.status === 429) {
+    throw new Error("Rate limit exceeded, maximum retries reached.");
   }
 
   return response;
@@ -546,7 +566,9 @@ async function uploadAttachmentsToChannel(channelId, attachments) {
 
     // Append up to 10 attachments
     attachments.forEach((attachment, index) => {
-      const blob = new Blob([attachment.content], { type: attachment.contentType });
+      const blob = new Blob([attachment.content], {
+        type: attachment.contentType,
+      });
       formData.append(`files[${index}]`, blob, attachment.filename);
     });
 
@@ -590,7 +612,8 @@ export default {
   async email(event, env, ctx) {
     GUILD_ID = env.GUILD_ID;
     TOKEN = env.TOKEN;
-    ROLES_REQUIRED = env.ROLES_REQUIRED === "" ? [] : env.ROLES_REQUIRED.split(",");
+    ROLES_REQUIRED =
+      env.ROLES_REQUIRED === "" ? [] : env.ROLES_REQUIRED.split(",");
     CHANNEL_MAP = Object.fromEntries(
       env.CHANNEL_MAP.split(",").map((item) => item.trim().split(":"))
     );
@@ -625,7 +648,12 @@ export default {
         }
       }
 
-      await sendEmbedMessage(targetChannelId, parsedEmail, event, attachmentLinks);
+      await sendEmbedMessage(
+        targetChannelId,
+        parsedEmail,
+        event,
+        attachmentLinks
+      );
 
       await sendAutoReply(event, parsedEmail);
     } catch (error) {
