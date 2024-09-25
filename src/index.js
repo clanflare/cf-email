@@ -11,7 +11,7 @@ const API_VERSION = 10;
 const DISCORD_API_URL = `https://discord.com/api/v${API_VERSION}`;
 
 // Variables to hold environment variables
-var GUILD_ID, TOKEN, ROLES_REQUIRED, CHANNEL_MAP;
+var GUILD_ID, TOKEN, ROLES_REQUIRED, CHANNEL_MAP, ATTACHMENTS_CHANNEL;
 
 // Headers and request options
 let myHeaders = new Headers();
@@ -58,7 +58,9 @@ async function parseEmail(event) {
 // Function to find Discord member by username
 async function findDiscordMember(username) {
   try {
-    const fetchMemberURL = `${DISCORD_API_URL}/guilds/${GUILD_ID}/members/search?query=${encodeURIComponent(username)}&limit=1000`;
+    const fetchMemberURL = `${DISCORD_API_URL}/guilds/${GUILD_ID}/members/search?query=${encodeURIComponent(
+      username
+    )}&limit=1000`;
     const response = await fetchWithRateLimit(fetchMemberURL, requestOptions);
     if (!response.ok) {
       throw new Error(
@@ -111,7 +113,7 @@ async function createDmChannel(recipientId) {
 async function sendAutoReply(event, parsedEmail, errorMsg = null) {
   try {
     const timestamp = new Date().toISOString();
-    const subject = `Re: ${parsedEmail.subject}`;
+    const subject = `Re: ${parsedEmail.subject || "No Subject"}`;
     const originalRecipient = parsedEmail.to[0].address.split("@")[0];
     const messageData = errorMsg
       ? `
@@ -127,7 +129,8 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
       `
       : `
         <p>Dear Sender,</p>
-        <p>Thank you for your email. This is an automated reply to confirm that your email with the subject "<strong>${parsedEmail.subject}</strong>" has been successfully delivered to the recipient: <strong>${originalRecipient}</strong>.</p>
+        <p>Thank you for your email. This is an automated reply to confirm that your email with the subject "<strong>${parsedEmail.subject || "No Subject"
+      }</strong>" has been successfully delivered to the recipient: <strong>${originalRecipient}</strong>.</p>
         <p>If you have any further inquiries, please feel free to reach out.</p>
         <p>Best regards,<br/>Clanflare</p>
         <hr />
@@ -196,14 +199,20 @@ function truncateText(text, maxLength) {
 function extractTextFromHtml(htmlContent) {
   try {
     // Remove script and style tags and their content
-    htmlContent = htmlContent.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '');
-    htmlContent = htmlContent.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, '');
+    htmlContent = htmlContent.replace(
+      /<script[^>]*>([\s\S]*?)<\/script>/gi,
+      ""
+    );
+    htmlContent = htmlContent.replace(
+      /<style[^>]*>([\s\S]*?)<\/style>/gi,
+      ""
+    );
     // Replace line breaks and paragraph tags with newlines
-    htmlContent = htmlContent.replace(/<(br|\/p|p)[^>]*>/gi, '\n');
+    htmlContent = htmlContent.replace(/<(br|\/p|p)[^>]*>/gi, "\n");
     // Remove all remaining HTML tags
-    htmlContent = htmlContent.replace(/<[^>]+>/g, '');
+    htmlContent = htmlContent.replace(/<[^>]+>/g, "");
     // Replace multiple spaces and newlines with a single space
-    htmlContent = htmlContent.replace(/\s+/g, ' ').trim();
+    htmlContent = htmlContent.replace(/\s+/g, " ").trim();
     // Decode HTML entities
     const decodedText = decodeHtmlEntities(htmlContent);
     return decodedText;
@@ -216,13 +225,13 @@ function extractTextFromHtml(htmlContent) {
 // Function to decode HTML entities
 function decodeHtmlEntities(text) {
   const entities = {
-    nbsp: ' ',
-    amp: '&',
-    lt: '<',
-    gt: '>',
+    nbsp: " ",
+    amp: "&",
+    lt: "<",
+    gt: ">",
     quot: '"',
     apos: "'",
-    '#39': "'",
+    "#39": "'",
   };
   return text.replace(/&([^;]+);/g, (match, entity) => {
     if (entities[entity]) {
@@ -245,11 +254,11 @@ function extractLinksAndImages(htmlContent) {
   while ((match = linkRegex.exec(htmlContent)) !== null) {
     const href = match[1];
     const text = match[2];
-    if (href.startsWith('http://') || href.startsWith('https://')) {
+    if (href.startsWith("http://") || href.startsWith("https://")) {
       httpLinks.push({ href, text });
-    } else if (href.startsWith('mailto:')) {
+    } else if (href.startsWith("mailto:")) {
       mailtoLinks.push({ href, text });
-    } else if (href.startsWith('tel:')) {
+    } else if (href.startsWith("tel:")) {
       telLinks.push({ href, text });
     } else {
       // Handle other schemes if necessary
@@ -267,7 +276,7 @@ function extractLinksAndImages(htmlContent) {
 }
 
 // Function to send an embed message in a Discord channel
-async function sendEmbedMessage(channelId, parsedEmail, event) {
+async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) {
   try {
     // Fetch guild data to get the icon dynamically
     const guildData = await fetchGuildData(GUILD_ID);
@@ -290,15 +299,14 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
     // Provide a fallback if no text content is available
     emailTextContent = emailTextContent || "(No text content)";
 
-    // Truncate content to respect Discord embed character limits
-    const title = truncateText(`📧 ${parsedEmail.subject || "New Email Received"}`, 256);
-    const description = truncateText(emailTextContent, 4096);
+    let title = `📧 ${parsedEmail.subject || "New Email Received"}`;
+    let description = emailTextContent;
     const fromField = truncateText(event.from, 256);
     const toField = truncateText(
       parsedEmail.to.map((addr) => addr.address).join(", "),
       1024
     );
-    const footerText = truncateText("📬 Sent via Clanflare Email System", 2048);
+    let footerText = "📬 Sent via Clanflare Email System";
 
     // Build embed fields
     const embedFields = [
@@ -314,51 +322,73 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
       },
     ];
 
-    // Add mailto links to embed fields
-    if (mailtoLinks.length > 0) {
-      const mailtoText = mailtoLinks
-        .map((link) => `[${truncateText(link.text || link.href, 50)}](${link.href})`)
-        .join("\n");
-      embedFields.push({
-        name: "📧 Email Links",
-        value: mailtoText,
-        inline: false,
-      });
+    // Add attachment links to embed fields, ensuring each field's value is within 1024 characters
+    if (attachmentLinks && attachmentLinks.length > 0) {
+      const maxFieldLength = 1024;
+      const maxEmbedFields = 25;
+      let fieldsUsed = embedFields.length; // Already used fields
+
+      // Split the attachment links into chunks that fit within 1024 characters
+      let attachmentChunks = [];
+      let currentChunk = '';
+      let fieldsCount = 0;
+
+      for (let i = 0; i < attachmentLinks.length; i++) {
+        const linkText = `[Attachment ${i + 1}](${attachmentLinks[i]})\n`;
+        if ((currentChunk.length + linkText.length) > maxFieldLength) {
+          // Current chunk is full, add it to the list
+          attachmentChunks.push(currentChunk);
+          currentChunk = linkText;
+        } else {
+          currentChunk += linkText;
+        }
+      }
+      // Add the last chunk
+      if (currentChunk.length > 0) {
+        attachmentChunks.push(currentChunk);
+      }
+
+      // Now, add each chunk as a field, as long as we don't exceed the max fields
+      for (let i = 0; i < attachmentChunks.length && fieldsUsed < maxEmbedFields; i++) {
+        embedFields.push({
+          name: `📎 Attachments${attachmentChunks.length > 1 ? ` (${i + 1})` : ''}`,
+          value: attachmentChunks[i],
+          inline: true,
+        });
+        fieldsUsed++;
+      }
     }
 
-    // Add tel links to embed fields
-    if (telLinks.length > 0) {
-      const telText = telLinks
-        .map((link) => `[${truncateText(link.text || link.href, 50)}](${link.href})`)
-        .join("\n");
-      embedFields.push({
-        name: "📞 Telephone Links",
-        value: telText,
-        inline: false,
-      });
+    // Truncate content to respect Discord embed character limits
+    const maxTitleLength = 256;
+    const maxDescriptionLength = 4096;
+    const maxFooterLength = 2048;
+    const maxEmbedTotalLength = 6000;
+
+    // Truncate title and footer to their max lengths
+    title = truncateText(title, maxTitleLength);
+    footerText = truncateText(footerText, maxFooterLength);
+
+    // Calculate the total length of the embed components
+    let totalEmbedLength = title.length + description.length + footerText.length + fromField.length + toField.length;
+
+    // Add lengths of field names and values
+    for (const field of embedFields) {
+      totalEmbedLength += field.name.length + field.value.length;
     }
 
-    // Add http/https links to embed fields
-    if (httpLinks.length > 0) {
-      const linksText = httpLinks
-        .map((link) => `[${truncateText(link.text || link.href, 50)}](${link.href})`)
-        .join("\n");
-      embedFields.push({
-        name: "🔗 Links",
-        value: linksText,
-        inline: false,
-      });
+    // Adjust description length if total exceeds maxEmbedTotalLength
+    if (totalEmbedLength > maxEmbedTotalLength) {
+      const excessLength = totalEmbedLength - maxEmbedTotalLength;
+      const newDescriptionLength = description.length - excessLength;
+      description = truncateText(description, newDescriptionLength);
+      totalEmbedLength = maxEmbedTotalLength; // Now it should fit
     }
 
-    // Add images to embed fields
-    if (images.length > 0) {
-      embedFields.push({
-        name: "🖼️ Images",
-        value: images.map((src) => src).join("\n"),
-        inline: false,
-      });
-    }
+    // Ensure description does not exceed its own limit
+    description = truncateText(description, maxDescriptionLength);
 
+    // Reconstruct the embed with adjusted components
     const embed = {
       title: title,
       description: description,
@@ -368,31 +398,15 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
       },
       timestamp: new Date().toISOString(),
       thumbnail: {
-        url: thumbnailUrl || "https://cdn.discordapp.com/embed/avatars/0.png", // Default avatar if no icon is set
+        url:
+          thumbnailUrl ||
+          "https://cdn.discordapp.com/embed/avatars/0.png", // Default avatar if no icon is set
       },
     };
 
-    // Prepare message components (e.g., buttons)
-    const components = [];
-
-    // Add buttons for http/https links
-    if (httpLinks.length > 0) {
-      const linkButtons = httpLinks.slice(0, 5).map((link, index) => ({
-        type: 2, // Button
-        style: 5, // Link button
-        label: truncateText(link.text || `Link ${index + 1}`, 80),
-        url: link.href,
-      }));
-
-      components.push({
-        type: 1, // Action row
-        components: linkButtons,
-      });
-    }
 
     const payload = {
       embeds: [embed],
-      components: components,
     };
 
     const response = await fetchWithRateLimit(sendMessageURL, {
@@ -413,11 +427,6 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
       await sendFullTextMessage(channelId, emailTextContent);
     }
 
-    // Handle attachments if any
-    if (parsedEmail.attachments && parsedEmail.attachments.length > 0) {
-      await handleAttachments(channelId, parsedEmail.attachments);
-    }
-
     return await response.json();
   } catch (error) {
     console.error("Error sending embed message:", error);
@@ -430,24 +439,30 @@ async function sendFullTextMessage(channelId, textContent) {
   try {
     const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
     const maxMessageLength = 2000; // Discord's message character limit
-    let index = 0;
-    const totalLength = textContent.length;
+    const codeBlockOverhead = 8; // Length of "```\n" + "\n```"
+    const maxChunkSize = maxMessageLength - codeBlockOverhead;
+    const regex = new RegExp(`.{1,${maxChunkSize}}`, 'gs'); // 's' flag for dot to match newlines
 
-    while (index < totalLength) {
-      const chunk = textContent.substring(index, index + maxMessageLength - 6); // Adjust for code block markers
+    const chunks = textContent.match(regex);
+
+    for (const chunk of chunks) {
       const formattedChunk = `\`\`\`\n${chunk}\n\`\`\``; // Wrap in code block
 
       const response = await fetchWithRateLimit(sendMessageURL, {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bot ${TOKEN}`,
+        },
         body: JSON.stringify({ content: formattedChunk }),
-        ...requestOptions,
       });
+
       if (!response.ok) {
+        const errorText = await response.text();
         throw new Error(
-          `Failed to send message chunk. Status: ${response.status}`
+          `Failed to send message chunk. Status: ${response.status}. Error: ${errorText}`
         );
       }
-      index += maxMessageLength - 6;
     }
   } catch (error) {
     console.error("Error sending full text message:", error);
@@ -460,7 +475,7 @@ async function fetchWithRateLimit(url, options) {
   let response = await fetch(url, options);
 
   if (response.status === 429) {
-    const retryAfter = response.headers.get('Retry-After');
+    const retryAfter = response.headers.get("Retry-After");
     const retryAfterMs = retryAfter ? parseFloat(retryAfter) * 1000 : 1000; // Default to 1 second
     console.warn(`Rate limited. Retrying after ${retryAfterMs}ms`);
     await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
@@ -472,44 +487,71 @@ async function fetchWithRateLimit(url, options) {
 }
 
 // Function to handle attachments
-async function handleAttachments(channelId, attachments) {
-  console.log({attachments});
-  for (const attachment of attachments) {
-    // Check if the attachment is an image or other type
-    if (
-      attachment.mimeType.startsWith('image/') ||
-      attachment.mimeType.startsWith('application/') ||
-      attachment.mimeType.startsWith('text/')
-    ) {
-      // Send the attachment as a file message in Discord
-      await sendFileMessage(channelId, attachment);
-    } else {
-      // Handle other types of attachments as needed
-      console.warn(`Unsupported attachment type: ${attachment.contentType}`);
+async function handleAttachments(attachments) {
+  const attachmentLinks = [];
+
+  // Batch attachments into groups of up to 10 (Discord's limit per message)
+  const batches = [];
+  const batchSize = 10;
+
+  for (let i = 0; i < attachments.length; i += batchSize) {
+    batches.push(attachments.slice(i, i + batchSize));
+  }
+
+  for (const batch of batches) {
+    // Upload the batch and get the attachment URLs
+    const links = await uploadAttachmentsToChannel(ATTACHMENTS_CHANNEL, batch);
+    if (links && links.length > 0) {
+      attachmentLinks.push(...links);
     }
   }
+
+  return attachmentLinks;
 }
 
-// Function to send file messages to Discord
-async function sendFileMessage(channelId, attachment) {
-  const formData = new FormData();
-  const blob = new Blob([attachment.content], { type: attachment.contentType });
+// Function to upload multiple attachments to a specific channel and return their URLs
+async function uploadAttachmentsToChannel(channelId, attachments) {
+  try {
+    const formData = new FormData();
 
-  formData.append('file', blob, attachment.filename);
+    // Append up to 10 attachments
+    attachments.forEach((attachment, index) => {
+      const blob = new Blob([attachment.content], { type: attachment.contentType });
+      formData.append(`files[${index}]`, blob, attachment.filename);
+    });
 
-  const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
+    const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
 
-  const response = await fetchWithRateLimit(sendMessageURL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bot ${TOKEN}`,
-    },
-    body: formData,
-  });
+    const response = await fetchWithRateLimit(sendMessageURL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${TOKEN}`,
+      },
+      body: formData,
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Failed to send file message. Status: ${response.status}. Error: ${errorText}`);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Failed to upload attachments. Status: ${response.status}. Error: ${errorText}`
+      );
+    }
+
+    const messageData = await response.json();
+
+    // Get the attachment URLs from the message data
+    if (messageData.attachments && messageData.attachments.length > 0) {
+      const attachmentUrls = messageData.attachments.map(
+        (attachment) => attachment.url
+      );
+      return attachmentUrls;
+    } else {
+      console.error("No attachment URLs found in message data.");
+      return [];
+    }
+  } catch (error) {
+    console.error("Error uploading attachments:", error);
+    return [];
   }
 }
 
@@ -522,6 +564,7 @@ export default {
     CHANNEL_MAP = Object.fromEntries(
       env.CHANNEL_MAP.split(",").map((item) => item.trim().split(":"))
     );
+    ATTACHMENTS_CHANNEL = env.ATTACHMENTS_CHANNEL;
 
     myHeaders.append("Authorization", `Bot ${TOKEN}`);
     let parsedEmail = null;
@@ -529,8 +572,15 @@ export default {
       parsedEmail = await parseEmail(event);
       const username = parsedEmail.to[0].address.split("@")[0];
 
+      // Handle attachments first and get the attachment links
+      let attachmentLinks = [];
+      if (parsedEmail.attachments && parsedEmail.attachments.length > 0) {
+        attachmentLinks = await handleAttachments(parsedEmail.attachments);
+      }
+
+      let targetChannelId;
       if (CHANNEL_MAP[username]) {
-        await sendEmbedMessage(CHANNEL_MAP[username], parsedEmail, event);
+        targetChannelId = CHANNEL_MAP[username];
       } else {
         const member = await findDiscordMember(username);
 
@@ -539,11 +589,14 @@ export default {
             throw new Error(`Member does not have the required role(s).`);
           }
           const dm = await createDmChannel(member.user.id);
-          await sendEmbedMessage(dm.id, parsedEmail, event);
+          targetChannelId = dm.id;
         } else {
-          await sendEmbedMessage(CHANNEL_MAP["others"], parsedEmail, event);
+          targetChannelId = CHANNEL_MAP["others"];
         }
       }
+
+      await sendEmbedMessage(targetChannelId, parsedEmail, event, attachmentLinks);
+
       await sendAutoReply(event, parsedEmail);
     } catch (error) {
       console.error("Error handling email event:", error);
