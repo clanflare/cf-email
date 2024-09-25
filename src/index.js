@@ -291,110 +291,54 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
       emailTextContent = extractTextFromHtml(parsedEmail.html);
     }
 
-    // Extract links and images from HTML content
-    const { httpLinks, mailtoLinks, telLinks, images } = parsedEmail.html
-      ? extractLinksAndImages(parsedEmail.html)
-      : { httpLinks: [], mailtoLinks: [], telLinks: [], images: [] };
-
     // Provide a fallback if no text content is available
     emailTextContent = emailTextContent || "(No text content)";
 
-    let title = `📧 ${parsedEmail.subject || "New Email Received"}`;
-    let description = emailTextContent;
-    const fromField = truncateText(event.from, 256);
-    const toField = truncateText(
-      parsedEmail.to.map((addr) => addr.address).join(", "),
-      1024
-    );
-    let footerText = "📬 Sent via Clanflare Email System";
+    // Prepare "From" and "To" information
+    const fromField = event.from;
+    const toField = parsedEmail.to.map((addr) => addr.address).join(", ");
 
-    // Build embed fields
-    const embedFields = [
-      {
-        name: "👤 **From**",
-        value: fromField,
-        inline: true,
-      },
-      {
-        name: "📩 **To**",
-        value: toField,
-        inline: true,
-      },
-    ];
-
-    // Add attachment links to embed fields, ensuring each field's value is within 1024 characters
+    // Prepare attachment links
+    let attachmentsText = "";
     if (attachmentLinks && attachmentLinks.length > 0) {
-      const maxFieldLength = 1024;
-      const maxEmbedFields = 25;
-      let fieldsUsed = embedFields.length; // Already used fields
-
-      // Split the attachment links into chunks that fit within 1024 characters
-      let attachmentChunks = [];
-      let currentChunk = '';
-      let fieldsCount = 0;
-
-      for (let i = 0; i < attachmentLinks.length; i++) {
-        const linkText = `[Attachment ${i + 1}](${attachmentLinks[i]})\n`;
-        if ((currentChunk.length + linkText.length) > maxFieldLength) {
-          // Current chunk is full, add it to the list
-          attachmentChunks.push(currentChunk);
-          currentChunk = linkText;
-        } else {
-          currentChunk += linkText;
-        }
-      }
-      // Add the last chunk
-      if (currentChunk.length > 0) {
-        attachmentChunks.push(currentChunk);
-      }
-
-      // Now, add each chunk as a field, as long as we don't exceed the max fields
-      for (let i = 0; i < attachmentChunks.length && fieldsUsed < maxEmbedFields; i++) {
-        embedFields.push({
-          name: `📎 Attachments${attachmentChunks.length > 1 ? ` (${i + 1})` : ''}`,
-          value: attachmentChunks[i],
-          inline: true,
-        });
-        fieldsUsed++;
-      }
+      attachmentsText = attachmentLinks
+        .map((link, index) => `[Attachment ${index + 1}](${link})`)
+        .join("\n");
     }
+
+    // Construct the description
+    let descriptionParts = [];
+
+    // Add "From" and "To" information
+    descriptionParts.push(`**👤 From:** ${fromField}`);
+    descriptionParts.push(`**📩 To:** ${toField}`);
+
+    // Add attachments if any
+    if (attachmentsText) {
+      descriptionParts.push(`**📎 Attachments:**\n${attachmentsText}`);
+    }
+
+    // Add a separator
+    descriptionParts.push(`---`);
+
+    // Add the email content
+    descriptionParts.push(emailTextContent);
+
+    // Join all parts to form the full description
+    let description = descriptionParts.join("\n\n");
 
     // Truncate content to respect Discord embed character limits
-    const maxTitleLength = 256;
     const maxDescriptionLength = 4096;
-    const maxFooterLength = 2048;
-    const maxEmbedTotalLength = 6000;
-
-    // Truncate title and footer to their max lengths
-    title = truncateText(title, maxTitleLength);
-    footerText = truncateText(footerText, maxFooterLength);
-
-    // Calculate the total length of the embed components
-    let totalEmbedLength = title.length + description.length + footerText.length + fromField.length + toField.length;
-
-    // Add lengths of field names and values
-    for (const field of embedFields) {
-      totalEmbedLength += field.name.length + field.value.length;
+    if (description.length > maxDescriptionLength) {
+      description = description.substring(0, maxDescriptionLength - 3) + '...';
     }
 
-    // Adjust description length if total exceeds maxEmbedTotalLength
-    if (totalEmbedLength > maxEmbedTotalLength) {
-      const excessLength = totalEmbedLength - maxEmbedTotalLength;
-      const newDescriptionLength = description.length - excessLength;
-      description = truncateText(description, newDescriptionLength);
-      totalEmbedLength = maxEmbedTotalLength; // Now it should fit
-    }
-
-    // Ensure description does not exceed its own limit
-    description = truncateText(description, maxDescriptionLength);
-
-    // Reconstruct the embed with adjusted components
+    // Prepare the embed
     const embed = {
-      title: title,
+      title: `📧 ${parsedEmail.subject || "New Email Received"}`,
       description: description,
-      fields: embedFields,
       footer: {
-        text: footerText,
+        text: "📬 Sent via Clanflare Email System",
       },
       timestamp: new Date().toISOString(),
       thumbnail: {
@@ -403,7 +347,6 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
           "https://cdn.discordapp.com/embed/avatars/0.png", // Default avatar if no icon is set
       },
     };
-
 
     const payload = {
       embeds: [embed],
@@ -423,8 +366,9 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     }
 
     // Check if description was truncated, and send full content as a follow-up if necessary
-    if (description !== emailTextContent) {
+    if (description.endsWith('...') && emailTextContent.length > 0) {
       await sendFullTextMessage(channelId, emailTextContent);
+
     }
 
     return await response.json();
