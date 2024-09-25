@@ -4,7 +4,7 @@ globalThis.Buffer = Buffer;
 
 import { EmailMessage } from "cloudflare:email";
 import { createMimeMessage } from "mimetext";
-const PostalMime = require("postal-mime");
+import PostalMime from "postal-mime";
 
 // Discord API version and base URL
 const API_VERSION = 10;
@@ -47,7 +47,7 @@ async function streamToArrayBuffer(stream, streamSize) {
 async function parseEmail(event) {
   try {
     const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
-    const parser = new PostalMime.default();
+    const parser = new PostalMime();
     return await parser.parse(rawEmail);
   } catch (error) {
     console.error("Error parsing email:", error);
@@ -192,18 +192,25 @@ function truncateText(text, maxLength) {
     : text;
 }
 
-// Function to extract text from HTML content
+// Improved function to extract text from HTML content
 function extractTextFromHtml(htmlContent) {
-  // Remove script and style tags and their content
-  htmlContent = htmlContent.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '');
-  htmlContent = htmlContent.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, '');
-  // Replace line breaks and paragraph tags with newlines
-  htmlContent = htmlContent.replace(/<(br|\/p|p)[^>]*>/gi, '\n');
-  // Remove all remaining HTML tags
-  const textContent = htmlContent.replace(/<[^>]+>/g, '');
-  // Decode HTML entities
-  const decodedText = decodeHtmlEntities(textContent);
-  return decodedText;
+  try {
+    // Remove script and style tags and their content
+    htmlContent = htmlContent.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '');
+    htmlContent = htmlContent.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, '');
+    // Replace line breaks and paragraph tags with newlines
+    htmlContent = htmlContent.replace(/<(br|\/p|p)[^>]*>/gi, '\n');
+    // Remove all remaining HTML tags
+    htmlContent = htmlContent.replace(/<[^>]+>/g, '');
+    // Replace multiple spaces and newlines with a single space
+    htmlContent = htmlContent.replace(/\s+/g, ' ').trim();
+    // Decode HTML entities
+    const decodedText = decodeHtmlEntities(htmlContent);
+    return decodedText;
+  } catch (error) {
+    console.error("Error extracting text from HTML:", error);
+    return "(Error extracting text content)";
+  }
 }
 
 // Function to decode HTML entities
@@ -225,6 +232,40 @@ function decodeHtmlEntities(text) {
   });
 }
 
+// Function to extract links and images from HTML content
+function extractLinksAndImages(htmlContent) {
+  const httpLinks = [];
+  const mailtoLinks = [];
+  const telLinks = [];
+  const images = [];
+
+  // Extract links
+  const linkRegex = /<a[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi;
+  let match;
+  while ((match = linkRegex.exec(htmlContent)) !== null) {
+    const href = match[1];
+    const text = match[2];
+    if (href.startsWith('http://') || href.startsWith('https://')) {
+      httpLinks.push({ href, text });
+    } else if (href.startsWith('mailto:')) {
+      mailtoLinks.push({ href, text });
+    } else if (href.startsWith('tel:')) {
+      telLinks.push({ href, text });
+    } else {
+      // Handle other schemes if necessary
+      console.warn(`Unsupported link scheme: ${href}`);
+    }
+  }
+
+  // Extract images
+  const imgRegex = /<img[^>]*src="([^"]*)"[^>]*>/gi;
+  while ((match = imgRegex.exec(htmlContent)) !== null) {
+    images.push(match[1]);
+  }
+
+  return { httpLinks, mailtoLinks, telLinks, images };
+}
+
 // Function to send an embed message in a Discord channel
 async function sendEmbedMessage(channelId, parsedEmail, event) {
   try {
@@ -241,44 +282,87 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
       emailTextContent = extractTextFromHtml(parsedEmail.html);
     }
 
+    // Extract links and images from HTML content
+    const { httpLinks, mailtoLinks, telLinks, images } = parsedEmail.html
+      ? extractLinksAndImages(parsedEmail.html)
+      : { httpLinks: [], mailtoLinks: [], telLinks: [], images: [] };
+
     // Provide a fallback if no text content is available
     emailTextContent = emailTextContent || "(No text content)";
 
     // Truncate content to respect Discord embed character limits
-    const title = truncateText(`📧 New Email Received`, 256);
+    const title = truncateText(`📧 ${parsedEmail.subject || "New Email Received"}`, 256);
     const description = truncateText(emailTextContent, 4096);
     const fromField = truncateText(event.from, 256);
     const toField = truncateText(
       parsedEmail.to.map((addr) => addr.address).join(", "),
       1024
     );
-    const subjectField = truncateText(
-      parsedEmail.subject || "(No subject)",
-      1024
-    );
     const footerText = truncateText("📬 Sent via Clanflare Email System", 2048);
+
+    // Build embed fields
+    const embedFields = [
+      {
+        name: "👤 **From**",
+        value: fromField,
+        inline: true,
+      },
+      {
+        name: "📩 **To**",
+        value: toField,
+        inline: true,
+      },
+    ];
+
+    // Add mailto links to embed fields
+    if (mailtoLinks.length > 0) {
+      const mailtoText = mailtoLinks
+        .map((link) => `[${truncateText(link.text || link.href, 50)}](${link.href})`)
+        .join("\n");
+      embedFields.push({
+        name: "📧 Email Links",
+        value: mailtoText,
+        inline: false,
+      });
+    }
+
+    // Add tel links to embed fields
+    if (telLinks.length > 0) {
+      const telText = telLinks
+        .map((link) => `[${truncateText(link.text || link.href, 50)}](${link.href})`)
+        .join("\n");
+      embedFields.push({
+        name: "📞 Telephone Links",
+        value: telText,
+        inline: false,
+      });
+    }
+
+    // Add http/https links to embed fields
+    if (httpLinks.length > 0) {
+      const linksText = httpLinks
+        .map((link) => `[${truncateText(link.text || link.href, 50)}](${link.href})`)
+        .join("\n");
+      embedFields.push({
+        name: "🔗 Links",
+        value: linksText,
+        inline: false,
+      });
+    }
+
+    // Add images to embed fields
+    if (images.length > 0) {
+      embedFields.push({
+        name: "🖼️ Images",
+        value: images.map((src) => src).join("\n"),
+        inline: false,
+      });
+    }
 
     const embed = {
       title: title,
       description: description,
-      color: 0x5865f2, // Discord's blurple color
-      fields: [
-        {
-          name: "👤 **From**",
-          value: fromField,
-          inline: true,
-        },
-        {
-          name: "📩 **To**",
-          value: toField,
-          inline: true,
-        },
-        {
-          name: "📝 **Subject**",
-          value: subjectField,
-          inline: false,
-        },
-      ],
+      fields: embedFields,
       footer: {
         text: footerText,
       },
@@ -288,15 +372,39 @@ async function sendEmbedMessage(channelId, parsedEmail, event) {
       },
     };
 
+    // Prepare message components (e.g., buttons)
+    const components = [];
+
+    // Add buttons for http/https links
+    if (httpLinks.length > 0) {
+      const linkButtons = httpLinks.slice(0, 5).map((link, index) => ({
+        type: 2, // Button
+        style: 5, // Link button
+        label: truncateText(link.text || `Link ${index + 1}`, 80),
+        url: link.href,
+      }));
+
+      components.push({
+        type: 1, // Action row
+        components: linkButtons,
+      });
+    }
+
+    const payload = {
+      embeds: [embed],
+      components: components,
+    };
+
     const response = await fetchWithRateLimit(sendMessageURL, {
       method: "POST",
-      body: JSON.stringify({ embeds: [embed] }),
+      body: JSON.stringify(payload),
       ...requestOptions,
     });
 
     if (!response.ok) {
+      const errorText = await response.text();
       throw new Error(
-        `Failed to send embed message. Status: ${response.status}`
+        `Failed to send embed message. Status: ${response.status}. Error: ${errorText}`
       );
     }
 
@@ -365,14 +473,18 @@ async function fetchWithRateLimit(url, options) {
 
 // Function to handle attachments
 async function handleAttachments(channelId, attachments) {
+  console.log({attachments});
   for (const attachment of attachments) {
     // Check if the attachment is an image or other type
-    if (attachment.contentType.startsWith('image/') || attachment.contentType.startsWith('application/')) {
+    if (
+      attachment.mimeType.startsWith('image/') ||
+      attachment.mimeType.startsWith('application/') ||
+      attachment.mimeType.startsWith('text/')
+    ) {
       // Send the attachment as a file message in Discord
       await sendFileMessage(channelId, attachment);
     } else {
       // Handle other types of attachments as needed
-      // For example, send a message indicating an unsupported attachment was received
       console.warn(`Unsupported attachment type: ${attachment.contentType}`);
     }
   }
@@ -381,7 +493,9 @@ async function handleAttachments(channelId, attachments) {
 // Function to send file messages to Discord
 async function sendFileMessage(channelId, attachment) {
   const formData = new FormData();
-  formData.append('files[0]', new Blob([attachment.content], { type: attachment.contentType }), attachment.filename);
+  const blob = new Blob([attachment.content], { type: attachment.contentType });
+
+  formData.append('file', blob, attachment.filename);
 
   const sendMessageURL = `${DISCORD_API_URL}/channels/${channelId}/messages`;
 
@@ -394,7 +508,8 @@ async function sendFileMessage(channelId, attachment) {
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to send file message. Status: ${response.status}`);
+    const errorText = await response.text();
+    throw new Error(`Failed to send file message. Status: ${response.status}. Error: ${errorText}`);
   }
 }
 
@@ -413,6 +528,7 @@ export default {
     try {
       parsedEmail = await parseEmail(event);
       const username = parsedEmail.to[0].address.split("@")[0];
+
       if (CHANNEL_MAP[username]) {
         await sendEmbedMessage(CHANNEL_MAP[username], parsedEmail, event);
       } else {
