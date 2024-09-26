@@ -15,7 +15,7 @@ const API_VERSION = 10;
 const DISCORD_API_URL = `https://discord.com/api/v${API_VERSION}`;
 
 // Environment variables (to be initialized in the main function)
-let GUILD_ID, TOKEN, ROLES_REQUIRED, CHANNEL_MAP, ATTACHMENTS_CHANNEL;
+let GUILD_ID, TOKEN, ROLES_REQUIRED, CHANNEL_MAP, ATTACHMENTS_CHANNEL, LOG_CHANNEL_ID;
 
 // Headers and request options
 const myHeaders = new Headers();
@@ -24,6 +24,13 @@ myHeaders.append("Content-Type", "application/json");
 // Rate limiting configuration
 const MAX_RETRIES = 3;
 const DEFAULT_RETRY_AFTER_MS = 1000; // 1 second
+
+/**
+ * Logging Variables
+ */
+
+// Array to collect log entries
+let logEntries = [];
 
 /**
  * Utility Functions
@@ -36,6 +43,7 @@ async function streamToArrayBuffer(stream) {
     return new Uint8Array(arrayBuffer);
   } catch (error) {
     console.error("Error converting stream to ArrayBuffer:", error);
+    await logToDiscord("ERROR", `Error converting stream to ArrayBuffer: ${error.message}`);
     throw new Error("Failed to process email stream.");
   }
 }
@@ -57,7 +65,10 @@ async function fetchWithRateLimit(url, options, retries = MAX_RETRIES) {
   }
 
   if (response.status === 429) {
-    throw new Error("Rate limit exceeded, maximum retries reached.");
+    const errorMsg = "Rate limit exceeded, maximum retries reached.";
+    console.error(errorMsg);
+    await logToDiscord("ERROR", errorMsg);
+    throw new Error(errorMsg);
   }
 
   return response;
@@ -100,17 +111,34 @@ function extractTextFromHtml(htmlContent) {
 }
 
 /**
+ * Logging Functions
+ */
+
+// Add a log entry to the logEntries array
+function logToDiscord(level, message) {
+  const timestamp = new Date().toISOString();
+  logEntries.push({ timestamp, level, message });
+}
+
+/**
  * Email Handling Functions
  */
 
 // Parse the email using PostalMime
 async function parseEmail(event) {
   try {
+    logToDiscord("INFO", "Starting to parse email.");
     const rawEmail = await streamToArrayBuffer(event.raw);
     const parser = new PostalMime();
-    return await parser.parse(rawEmail);
+    const parsedEmail = await parser.parse(rawEmail);
+    logToDiscord(
+      "INFO",
+      `Email parsed successfully.\nSubject: ${parsedEmail.subject || "No Subject"}`
+    );
+    return parsedEmail;
   } catch (error) {
     console.error("Error parsing email:", error);
+    logToDiscord("ERROR", `Error parsing email: ${error.message}`);
     throw new Error("Failed to parse email content.");
   }
 }
@@ -143,8 +171,15 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
         <p style="font-size: 0.9em; color: #888;">Timestamp: ${timestamp}</p>
       `;
 
-    const fromAddress = parsedEmail.from.address;
+    const fromAddress = parsedEmail.from?.address || parsedEmail.from?.[0]?.address;
     const toAddress = parsedEmail.to[0].address;
+
+    if (!fromAddress) {
+      const warningMsg = "Original email is not repliable: Missing 'from' address.";
+      console.warn(warningMsg);
+      logToDiscord("WARN", warningMsg);
+      return;
+    }
 
     const msg = createMimeMessage();
     msg.setSender({ name: "Auto-replier", addr: toAddress });
@@ -161,17 +196,24 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
     });
 
     const message = new EmailMessage(toAddress, fromAddress, msg.asRaw());
+
     // Attempt to reply to the original email
     try {
       await event.reply(message);
+      logToDiscord("INFO", "Auto-reply sent successfully using event.reply().");
     } catch (replyError) {
       console.warn("event.reply() failed, attempting to send a new email:", replyError);
-
+      logToDiscord(
+        "WARN",
+        `event.reply() failed: ${replyError.message}. Attempting to send a new email.`
+      );
       // If event.reply() fails, send a new email instead
       await event.send(message);
+      logToDiscord("INFO", "Auto-reply sent using event.send().");
     }
   } catch (error) {
     console.error("Error sending auto-reply:", error);
+    logToDiscord("ERROR", `Error sending auto-reply: ${error.message}`);
   }
 }
 
@@ -192,9 +234,12 @@ async function fetchGuildData() {
       throw new Error(`Failed to fetch guild data. Status: ${response.status}`);
     }
 
-    return await response.json();
+    const guildData = await response.json();
+    logToDiscord("INFO", `Fetched guild data: ${guildData.name}`);
+    return guildData;
   } catch (error) {
     console.error("Error fetching guild data:", error);
+    logToDiscord("ERROR", `Error fetching guild data: ${error.message}`);
     throw new Error("Failed to fetch guild information.");
   }
 }
@@ -224,9 +269,19 @@ async function findDiscordMember(username) {
     }
 
     const members = await response.json();
-    return members.find((mem) => mem.user.username === username);
+    const member = members.find((mem) => mem.user.username === username);
+    if (member) {
+      logToDiscord(
+        "INFO",
+        `Found Discord member: ${member.user.username}#${member.user.discriminator}`
+      );
+    } else {
+      logToDiscord("WARN", `Discord member not found for username: ${username}`);
+    }
+    return member;
   } catch (error) {
     console.error("Error fetching Discord member:", error);
+    logToDiscord("ERROR", `Error fetching Discord member: ${error.message}`);
     throw new Error(`Failed to find Discord member with username: ${username}`);
   }
 }
@@ -238,7 +293,8 @@ function hasRequiredRoles(member) {
 
   if (ROLES_REQUIRED.length === 0) return true; // No roles required
 
-  return ROLES_REQUIRED.some((role) => memberRoles.includes(role));
+  const hasRoles = ROLES_REQUIRED.some((role) => memberRoles.includes(role));
+  return hasRoles;
 }
 
 // Create a DM channel with the user
@@ -258,29 +314,47 @@ async function createDmChannel(recipientId) {
       throw new Error(`Failed to create DM channel. Status: ${response.status}`);
     }
 
-    return await response.json();
+    const dmChannel = await response.json();
+    logToDiscord("INFO", `Created DM channel with user ID: ${recipientId}`);
+    return dmChannel;
   } catch (error) {
     console.error("Error creating DM channel:", error);
+    logToDiscord("ERROR", `Error creating DM channel: ${error.message}`);
     throw new Error("Failed to create a direct message channel with the member.");
   }
 }
 
 // Send a batch of embeds to a Discord channel
-async function sendEmbedBatch(channelId, payload) {
+async function sendEmbedBatch(channelId, payload, attachments = null) {
+  const options = {
+    method: "POST",
+    headers: {
+      Authorization: `Bot ${TOKEN}`,
+    },
+  };
+
+  if (attachments) {
+    // Sending with attachments
+    const formData = new FormData();
+    formData.append("payload_json", JSON.stringify(payload));
+    attachments.forEach((attachment, index) => {
+      formData.append(`files[${index}]`, attachment.blob, attachment.filename);
+    });
+    options.body = formData;
+  } else {
+    // Sending without attachments
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(payload);
+  }
+
   const response = await fetchWithRateLimit(
     `${DISCORD_API_URL}/channels/${channelId}/messages`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bot ${TOKEN}`,
-      },
-      body: JSON.stringify(payload),
-    }
+    options
   );
 
   if (!response.ok) {
     const errorText = await response.text();
+    logToDiscord("ERROR", `Failed to send embed batch: ${errorText}`);
     throw new Error(`Failed to send message. Status: ${response.status}. Error: ${errorText}`);
   }
 
@@ -288,7 +362,7 @@ async function sendEmbedBatch(channelId, payload) {
 }
 
 // Send multiple embeds with batching
-async function sendEmbedsWithBatching(channelId, embeds) {
+async function sendEmbedsWithBatching(channelId, embeds, attachments = null) {
   const MAX_EMBEDS_PER_MESSAGE = 10;
   const MAX_TOTAL_EMBED_SIZE = 6000; // Maximum total size of embeds per message
   const messages = [];
@@ -322,10 +396,11 @@ async function sendEmbedsWithBatching(channelId, embeds) {
   // Send any remaining embeds
   if (currentBatch.length > 0) {
     const payload = { embeds: currentBatch };
-    await sendEmbedBatch(channelId, payload);
+    await sendEmbedBatch(channelId, payload, attachments);
     messages.push(payload);
   }
 
+  logToDiscord("INFO", `Sent ${embeds.length} embeds to channel ID: ${channelId}`);
   return messages;
 }
 
@@ -361,14 +436,17 @@ async function sendTextAttachment(channelId, textContent, attachmentLinks) {
 
     if (!response.ok) {
       const errorText = await response.text();
+      logToDiscord("ERROR", `Failed to send text attachment: ${errorText}`);
       throw new Error(
         `Failed to send message with attachment. Status: ${response.status}. Error: ${errorText}`
       );
     }
 
+    logToDiscord("INFO", `Sent text attachment to channel ID: ${channelId}`);
     return await response.json();
   } catch (error) {
     console.error("Error sending text attachment:", error);
+    logToDiscord("ERROR", `Error sending text attachment: ${error.message}`);
     throw new Error("Failed to send the text attachment.");
   }
 }
@@ -396,6 +474,7 @@ async function uploadAttachmentsToChannel(channelId, attachments) {
 
     if (!response.ok) {
       const errorText = await response.text();
+      logToDiscord("ERROR", `Failed to upload attachments: ${errorText}`);
       throw new Error(
         `Failed to upload attachments. Status: ${response.status}. Error: ${errorText}`
       );
@@ -405,13 +484,18 @@ async function uploadAttachmentsToChannel(channelId, attachments) {
 
     // Extract attachment URLs
     if (messageData.attachments && messageData.attachments.length > 0) {
-      return messageData.attachments.map((attachment) => attachment.url);
+      const urls = messageData.attachments.map((attachment) => attachment.url);
+      logToDiscord("INFO", `Uploaded ${urls.length} attachments to channel ID: ${channelId}`);
+      return urls;
     } else {
-      console.error("No attachment URLs found in message data.");
+      const errorMsg = "No attachment URLs found in message data.";
+      console.error(errorMsg);
+      logToDiscord("WARN", errorMsg);
       return [];
     }
   } catch (error) {
     console.error("Error uploading attachments:", error);
+    logToDiscord("ERROR", `Error uploading attachments: ${error.message}`);
     return [];
   }
 }
@@ -435,6 +519,7 @@ async function handleAttachments(attachments) {
     }
   }
 
+  logToDiscord("INFO", `Handled ${attachments.length} attachments.`);
   return attachmentLinks;
 }
 
@@ -446,7 +531,7 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     const thumbnailUrl = getGuildIconURL(guildData);
 
     // Prepare email fields
-    const fromField = event.from;
+    const fromField = parsedEmail.from?.text || parsedEmail.from?.value?.[0]?.address || "Unknown";
     const toField = parsedEmail.to.map((addr) => addr.address).join(", ");
 
     // Extract email text content
@@ -464,7 +549,11 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     let embeds = [
       {
         title,
-        description: truncateText(`**👤 From:** ${fromField}\n\n**📩 To:** ${toField}`, MAX_DESCRIPTION_LENGTH),
+        description: truncateText(
+          `**👤 From:** ${fromField}\n**📩 To:** ${toField}\n**📅 Date:** ${parsedEmail.date ||
+            timestamp}\n**📎 Attachments:** ${attachmentLinks.length}`,
+          MAX_DESCRIPTION_LENGTH
+        ),
         footer: { text: footerText },
         timestamp,
         thumbnail: { url: thumbnailUrl },
@@ -522,9 +611,84 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     if (emailTextContent && emailTextContent.length > 0) {
       await sendTextAttachment(channelId, emailTextContent, attachmentLinks);
     }
+
+    logToDiscord("INFO", `Sent email content to channel ID: ${channelId}`);
   } catch (error) {
     console.error("Error sending embed message:", error);
+    logToDiscord("ERROR", `Error sending embed message: ${error.message}`);
     throw new Error("Failed to send an embed message to the member.");
+  }
+}
+
+/**
+ * Function to send log entries as embeds to the log channel with attachment
+ */
+async function sendLogEmbeds() {
+  if (!LOG_CHANNEL_ID || logEntries.length === 0) return; // If no log channel is specified or no logs, skip
+
+  try {
+    const MAX_EMBEDS_PER_MESSAGE = 10;
+    const MAX_EMBED_DESCRIPTION_LENGTH = 4096;
+    const embedBatches = [];
+
+    let currentBatch = [];
+    let currentDescription = "";
+
+    for (const entry of logEntries) {
+      const logMessage = `**[${entry.level}] ${entry.timestamp}**\n${entry.message}\n\n`;
+      if (currentDescription.length + logMessage.length > MAX_EMBED_DESCRIPTION_LENGTH) {
+        // Add current description to batch
+        currentBatch.push({
+          description: currentDescription,
+          color: entry.level === "ERROR" ? 0xff0000 : entry.level === "WARN" ? 0xffff00 : 0x00ff00,
+        });
+        currentDescription = logMessage;
+      } else {
+        currentDescription += logMessage;
+      }
+
+      // If current batch reaches max embeds per message, add to embedBatches
+      if (currentBatch.length >= MAX_EMBEDS_PER_MESSAGE) {
+        embedBatches.push([...currentBatch]);
+        currentBatch = [];
+      }
+    }
+
+    // Add any remaining logs to batches
+    if (currentDescription.length > 0) {
+      currentBatch.push({
+        description: currentDescription,
+        color: 0x00ff00, // Default color
+      });
+    }
+    if (currentBatch.length > 0) {
+      embedBatches.push([...currentBatch]);
+    }
+
+    // Create the log text content
+    const logTextContent = logEntries
+      .map((entry) => `[${entry.level}] ${entry.timestamp} - ${entry.message}`)
+      .join("\n");
+
+    // Create a Blob for the log text attachment
+    const logBlob = new Blob([logTextContent], { type: "text/plain" });
+    const logAttachment = {
+      blob: logBlob,
+      filename: `log_${new Date().toISOString()}.txt`,
+    };
+
+    // Send embed batches with attachment
+    for (const batch of embedBatches) {
+      const payload = { embeds: batch };
+      await sendEmbedBatch(LOG_CHANNEL_ID, payload, [logAttachment]);
+      // Only attach the log file once
+      logAttachment.blob = null;
+    }
+  } catch (error) {
+    console.error("Error sending log embeds:", error);
+  } finally {
+    // Clear log entries after sending
+    logEntries = [];
   }
 }
 
@@ -539,7 +703,8 @@ export default {
       // Initialize environment variables with defaults or throw errors if required variables are missing
       if (!env.GUILD_ID) throw new Error("GUILD_ID environment variable is not defined.");
       if (!env.TOKEN) throw new Error("TOKEN environment variable is not defined.");
-      if (!env.ATTACHMENTS_CHANNEL) throw new Error("ATTACHMENTS_CHANNEL environment variable is not defined.");
+      if (!env.ATTACHMENTS_CHANNEL)
+        throw new Error("ATTACHMENTS_CHANNEL environment variable is not defined.");
 
       GUILD_ID = env.GUILD_ID;
       TOKEN = env.TOKEN;
@@ -554,10 +719,25 @@ export default {
       }
 
       ATTACHMENTS_CHANNEL = env.ATTACHMENTS_CHANNEL;
+      LOG_CHANNEL_ID = env.LOG_CHANNEL_ID; // New environment variable for logging
 
       myHeaders.append("Authorization", `Bot ${TOKEN}`);
+      logToDiscord("INFO", "Email event received.");
+
+      // Log event details
+      logToDiscord("INFO", `Event details:\nFrom: ${event.from}\nTo: ${event.to}`);
+
       parsedEmail = await parseEmail(event);
       const username = parsedEmail.to[0].address.split("@")[0];
+      logToDiscord("INFO", `Parsed email intended for username: ${username}`);
+
+      // Log email details
+      logToDiscord(
+        "INFO",
+        `Email details:\nSubject: ${parsedEmail.subject || "No Subject"}\nFrom: ${
+          parsedEmail.from?.text || parsedEmail.from?.value?.[0]?.address || "Unknown"
+        }\nTo: ${parsedEmail.to.map((addr) => addr.address).join(", ")}\nAttachments: ${parsedEmail.attachments?.length || 0}`
+      );
 
       // Handle attachments
       let attachmentLinks = [];
@@ -569,19 +749,26 @@ export default {
       let targetChannelId;
       if (CHANNEL_MAP[username]) {
         targetChannelId = CHANNEL_MAP[username];
+        logToDiscord("INFO", `Using channel from CHANNEL_MAP: ${targetChannelId}`);
       } else {
         const member = await findDiscordMember(username);
 
         if (member) {
           if (!hasRequiredRoles(member)) {
-            throw new Error("Member does not have the required role(s).");
+            const errorMsg = "Member does not have the required role(s).";
+            logToDiscord("WARN", errorMsg);
+            throw new Error(errorMsg);
           }
           const dm = await createDmChannel(member.user.id);
           targetChannelId = dm.id;
+          logToDiscord("INFO", `DM channel created: ${targetChannelId}`);
         } else if (CHANNEL_MAP["others"]) {
           targetChannelId = CHANNEL_MAP["others"];
+          logToDiscord("INFO", `Using 'others' channel from CHANNEL_MAP: ${targetChannelId}`);
         } else {
-          throw new Error("No target channel found for the recipient.");
+          const errorMsg = "No target channel found for the recipient.";
+          logToDiscord("ERROR", errorMsg);
+          throw new Error(errorMsg);
         }
       }
 
@@ -590,9 +777,17 @@ export default {
 
       // Send auto-reply
       await sendAutoReply(event, parsedEmail);
+
+      logToDiscord("INFO", "Email processing completed successfully.");
     } catch (error) {
       console.error("Error handling email event:", error);
-      await sendAutoReply(event, parsedEmail, error.message);
+      logToDiscord("ERROR", `Error handling email event: ${error.message}`);
+      if (parsedEmail) {
+        await sendAutoReply(event, parsedEmail, error.message);
+      }
+    } finally {
+      // Send all accumulated logs as embeds with attachment
+      await sendLogEmbeds();
     }
   },
 };
