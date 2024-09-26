@@ -2,7 +2,7 @@
   "name": "email_worker_parser",
   "version": "0.0.0",
   "devDependencies": {
-    "wrangler": "^3.72.1"
+    "wrangler": "^3.78.10"
   },
   "private": true,
   "scripts": {

@@ -370,7 +370,12 @@ const EmailHandler = {
   async sendAutoReply(event, parsedEmail, errorMsg = null) {
     try {
       const timestamp = new Date().toISOString();
-      const subject = `Re: ${parsedEmail.subject || "No Subject"}`;
+      let subject = parsedEmail.subject || "No Subject";
+
+      // Check if the subject already starts with "Re:" (case insensitive)
+      if (!/^Re:/i.test(subject.trim())) {
+        subject = `Re: ${subject}`;
+      }      
       const originalRecipient = parsedEmail.to[0]?.address.split("@")[0] || "Unknown";
       const messageData = errorMsg
         ? `
