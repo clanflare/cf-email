@@ -131,10 +131,7 @@ async function parseEmail(event) {
     const rawEmail = await streamToArrayBuffer(event.raw);
     const parser = new PostalMime();
     const parsedEmail = await parser.parse(rawEmail);
-    logToDiscord(
-      "INFO",
-      `Email parsed successfully.\nSubject: ${parsedEmail.subject || "No Subject"}`
-    );
+    logToDiscord("INFO", `Email parsed successfully.\nSubject: ${parsedEmail.subject || "No Subject"}`);
     return parsedEmail;
   } catch (error) {
     console.error("Error parsing email:", error);
@@ -143,12 +140,19 @@ async function parseEmail(event) {
   }
 }
 
+// Sanitize data to avoid logging sensitive information
+function sanitizeData(data) {
+  // Implement sanitization logic as needed
+  // For example, redact email addresses or other sensitive fields
+  return data;
+}
+
 // Send an auto-reply email
 async function sendAutoReply(event, parsedEmail, errorMsg = null) {
   try {
     const timestamp = new Date().toISOString();
     const subject = `Re: ${parsedEmail.subject || "No Subject"}`;
-    const originalRecipient = parsedEmail.to[0].address.split("@")[0];
+    const originalRecipient = parsedEmail.to[0]?.address.split("@")[0] || "Unknown";
     const messageData = errorMsg
       ? `
         <p>Dear Sender,</p>
@@ -171,8 +175,9 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
         <p style="font-size: 0.9em; color: #888;">Timestamp: ${timestamp}</p>
       `;
 
-    const fromAddress = parsedEmail.from?.address || parsedEmail.from?.[0]?.address;
-    const toAddress = parsedEmail.to[0].address;
+    // Fallback to event.from if parsedEmail.from is missing
+    const fromAddress = parsedEmail.from?.[0]?.address || parsedEmail.from?.address || event.from;
+    const toAddress = parsedEmail.to?.[0]?.address || event.to;
 
     if (!fromAddress) {
       const warningMsg = "Original email is not repliable: Missing 'from' address.";
@@ -203,10 +208,7 @@ async function sendAutoReply(event, parsedEmail, errorMsg = null) {
       logToDiscord("INFO", "Auto-reply sent successfully using event.reply().");
     } catch (replyError) {
       console.warn("event.reply() failed, attempting to send a new email:", replyError);
-      logToDiscord(
-        "WARN",
-        `event.reply() failed: ${replyError.message}. Attempting to send a new email.`
-      );
+      logToDiscord("WARN", `event.reply() failed: ${replyError.message}. Attempting to send a new email.`);
       // If event.reply() fails, send a new email instead
       await event.send(message);
       logToDiscord("INFO", "Auto-reply sent using event.send().");
@@ -271,10 +273,7 @@ async function findDiscordMember(username) {
     const members = await response.json();
     const member = members.find((mem) => mem.user.username === username);
     if (member) {
-      logToDiscord(
-        "INFO",
-        `Found Discord member: ${member.user.username}#${member.user.discriminator}`
-      );
+      logToDiscord("INFO", `Found Discord member: ${member.user.username}#${member.user.discriminator}`);
     } else {
       logToDiscord("WARN", `Discord member not found for username: ${username}`);
     }
@@ -530,16 +529,20 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
     const guildData = await fetchGuildData();
     const thumbnailUrl = getGuildIconURL(guildData);
 
-    // Prepare email fields
-    const fromField = parsedEmail.from?.text || parsedEmail.from?.value?.[0]?.address || "Unknown";
-    const toField = parsedEmail.to.map((addr) => addr.address).join(", ");
+    // Prepare email fields with fallback
+    const fromField = parsedEmail.from?.address || parsedEmail.from?.[0]?.address || event.from || "Unknown";
+    const toField = parsedEmail.to?.map((addr) => addr.address).join(", ") || event.to || "Unknown";
 
     // Extract email text content
     let emailTextContent = parsedEmail.text || extractTextFromHtml(parsedEmail.html);
     emailTextContent = emailTextContent || "(No text content)";
 
+    // Sanitize email text content for privacy
+    emailTextContent = sanitizeData(emailTextContent);
+
     // Maximum lengths
     const MAX_DESCRIPTION_LENGTH = 4096;
+    const MAX_TOTAL_EMBED_SIZE = 6000; // Max total size of embeds per message
 
     // Construct the initial embed
     const title = `📧 ${parsedEmail.subject || "New Email Received"}`;
@@ -551,7 +554,7 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
         title,
         description: truncateText(
           `**👤 From:** ${fromField}\n**📩 To:** ${toField}\n**📅 Date:** ${parsedEmail.date ||
-            timestamp}\n**📎 Attachments:** ${attachmentLinks.length}`,
+          timestamp}\n**📎 Attachments:** ${attachmentLinks.length}`,
           MAX_DESCRIPTION_LENGTH
         ),
         footer: { text: footerText },
@@ -560,7 +563,7 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
       },
     ];
 
-    // Add attachment links to embeds
+    // Add attachment links to embeds (if any)
     if (attachmentLinks && attachmentLinks.length > 0) {
       const attachmentChunks = [];
       let currentChunk = "";
@@ -597,11 +600,22 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
         chunk = chunk.substring(0, lastSpaceIndex);
       }
 
+      content = content.substring(chunk.length).trim();
+
+      // Check if the remaining content is small enough to append
+      if (
+        content.length > 0 &&
+        content.length < 500 && // Threshold for small remaining content
+        chunk.length + content.length <= MAX_DESCRIPTION_LENGTH
+      ) {
+        // Append remaining content to current chunk
+        chunk += ' ' + content;
+        content = '';
+      }
+
       embeds.push({
         description: chunk,
       });
-
-      content = content.substring(chunk.length).trim();
     }
 
     // Send embeds with batching
@@ -623,44 +637,52 @@ async function sendEmbedMessage(channelId, parsedEmail, event, attachmentLinks) 
 /**
  * Function to send log entries as embeds to the log channel with attachment
  */
-async function sendLogEmbeds() {
+async function sendLogEmbeds(detailedLog) {
   if (!LOG_CHANNEL_ID || logEntries.length === 0) return; // If no log channel is specified or no logs, skip
 
   try {
     const MAX_EMBEDS_PER_MESSAGE = 10;
     const MAX_EMBED_DESCRIPTION_LENGTH = 4096;
-    const embedBatches = [];
+    const MAX_TOTAL_EMBED_SIZE = 6000; // Max total size of embeds per message
 
+    const embedBatches = [];
     let currentBatch = [];
-    let currentDescription = "";
+    let currentTotalEmbedSize = 0;
 
     for (const entry of logEntries) {
       const logMessage = `**[${entry.level}] ${entry.timestamp}**\n${entry.message}\n\n`;
-      if (currentDescription.length + logMessage.length > MAX_EMBED_DESCRIPTION_LENGTH) {
-        // Add current description to batch
-        currentBatch.push({
-          description: currentDescription,
-          color: entry.level === "ERROR" ? 0xff0000 : entry.level === "WARN" ? 0xffff00 : 0x00ff00,
-        });
-        currentDescription = logMessage;
-      } else {
-        currentDescription += logMessage;
+      let description = logMessage;
+
+      // Truncate if necessary
+      if (description.length > MAX_EMBED_DESCRIPTION_LENGTH) {
+        description = description.substring(0, MAX_EMBED_DESCRIPTION_LENGTH - 3) + '...';
       }
 
-      // If current batch reaches max embeds per message, add to embedBatches
-      if (currentBatch.length >= MAX_EMBEDS_PER_MESSAGE) {
+      const embed = {
+        description,
+        color: entry.level === "ERROR" ? 0xff0000 : entry.level === "WARN" ? 0xffa500 : 0x00ff00,
+      };
+
+      const embedSize = JSON.stringify(embed).length;
+
+      // Check if adding this embed exceeds the total embed size limit or max embeds per message
+      if (
+        currentTotalEmbedSize + embedSize > MAX_TOTAL_EMBED_SIZE ||
+        currentBatch.length >= MAX_EMBEDS_PER_MESSAGE
+      ) {
+        // Add current batch to batches
         embedBatches.push([...currentBatch]);
+        // Reset batch and total size
         currentBatch = [];
+        currentTotalEmbedSize = 0;
       }
+
+      // Add embed to current batch
+      currentBatch.push(embed);
+      currentTotalEmbedSize += embedSize;
     }
 
-    // Add any remaining logs to batches
-    if (currentDescription.length > 0) {
-      currentBatch.push({
-        description: currentDescription,
-        color: 0x00ff00, // Default color
-      });
-    }
+    // Add any remaining embeds to batches
     if (currentBatch.length > 0) {
       embedBatches.push([...currentBatch]);
     }
@@ -670,19 +692,25 @@ async function sendLogEmbeds() {
       .map((entry) => `[${entry.level}] ${entry.timestamp} - ${entry.message}`)
       .join("\n");
 
+    // Append detailed data to the log text content
+    const detailedLogContent = `\n\nDetailed Data:\n${JSON.stringify(detailedLog, null, 2)}`;
+    const fullLogTextContent = logTextContent + detailedLogContent;
+
     // Create a Blob for the log text attachment
-    const logBlob = new Blob([logTextContent], { type: "text/plain" });
+    const logBlob = new Blob([fullLogTextContent], { type: "text/plain" });
     const logAttachment = {
       blob: logBlob,
       filename: `log_${new Date().toISOString()}.txt`,
     };
 
     // Send embed batches with attachment
-    for (const batch of embedBatches) {
+    for (const [index, batch] of embedBatches.entries()) {
       const payload = { embeds: batch };
-      await sendEmbedBatch(LOG_CHANNEL_ID, payload, [logAttachment]);
-      // Only attach the log file once
-      logAttachment.blob = null;
+
+      // Attach the log file only once
+      const attachments = index === 0 ? [logAttachment] : [];
+
+      await sendEmbedBatch(LOG_CHANNEL_ID, payload, attachments);
     }
   } catch (error) {
     console.error("Error sending log embeds:", error);
@@ -695,7 +723,6 @@ async function sendLogEmbeds() {
 /**
  * Main Handler
  */
-
 export default {
   async email(event, env, ctx) {
     let parsedEmail;
@@ -728,16 +755,24 @@ export default {
       logToDiscord("INFO", `Event details:\nFrom: ${event.from}\nTo: ${event.to}`);
 
       parsedEmail = await parseEmail(event);
-      const username = parsedEmail.to[0].address.split("@")[0];
+      const username = parsedEmail.to[0]?.address.split("@")[0] || "Unknown";
       logToDiscord("INFO", `Parsed email intended for username: ${username}`);
 
       // Log email details
       logToDiscord(
         "INFO",
-        `Email details:\nSubject: ${parsedEmail.subject || "No Subject"}\nFrom: ${
-          parsedEmail.from?.text || parsedEmail.from?.value?.[0]?.address || "Unknown"
-        }\nTo: ${parsedEmail.to.map((addr) => addr.address).join(", ")}\nAttachments: ${parsedEmail.attachments?.length || 0}`
+        `Email details:\nSubject: ${parsedEmail.subject || "No Subject"}\nFrom: ${parsedEmail.from?.address || parsedEmail.from?.[0]?.address || event.from || "Unknown"
+        }\nTo: ${parsedEmail.to?.map((addr) => addr.address).join(", ") || event.to || "Unknown"
+        }\nDate: ${parsedEmail.date || new Date().toISOString()
+        }\nAttachments: ${parsedEmail.attachments?.length || 0}`
       );
+
+      // Sanitize and log parsedEmail data
+      const sanitizedParsedEmail = sanitizeData(parsedEmail);
+      logToDiscord("INFO", `Parsed Email Data:\n${JSON.stringify(sanitizedParsedEmail, null, 2)}`);
+
+      // Log ctx data
+      logToDiscord("INFO", `Context Data:\n${JSON.stringify(ctx, null, 2)}`);
 
       // Handle attachments
       let attachmentLinks = [];
@@ -786,8 +821,19 @@ export default {
         await sendAutoReply(event, parsedEmail, error.message);
       }
     } finally {
+      // Prepare detailed log data
+      const detailedLog = {
+        parsedEmail: sanitizeData(parsedEmail) || {},
+        event: {
+          from: event.from,
+          to: event.to,
+          headers: event.headers,
+        },
+        ctx: ctx || {},
+      };
+
       // Send all accumulated logs as embeds with attachment
-      await sendLogEmbeds();
+      await sendLogEmbeds(detailedLog);
     }
   },
 };
